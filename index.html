@@ -35,24 +35,52 @@
     <input id="photo" class="pill" type="file" accept="image/*" capture="environment" />
     <button id="send" class="btn" disabled>この地点を送信</button>
   </div>
-  <div class="row" style="font-size:.9rem;color:#666">地図をタップ → 点を作成 → 送信でシートに保存</div>
+  <div class="row" style="font-size:.9rem;color:#666">地図をタップ → 点を作成 → 送信でシートに保存（住所は自動取得）</div>
 </div>
 
 <div id="toast"></div>
 
 <script>
-  // ★ここがあなたの実エンドポイント（OK表示を確認したURL）
+  // ★あなたのGAS /exec を入れています（そのままでOK）
   const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbw4wmqV__4kQO77AJmSLpyuLQH9tSblJJfxCWhIqHdpeEbX23ZZzEj2RV0OpwyK3sv5/exec';
 
   // 地理院タイル（標準地図）
   const GSI = "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
 
-  // ユーティリティ
+  // 便利関数
   const toast = (m)=>{ const t=document.getElementById('toast'); t.textContent=m;
-    t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2000); };
+    t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2200); };
   const toDataURL = (file)=> new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
 
-  // MapLibre（ラスタベース）
+  // 画像を送信前に圧縮（長辺1600px, 品質0.7）
+  async function compressImage(file, maxSide = 1600, quality = 0.7){
+    const src = await toDataURL(file);
+    const img = new Image();
+    img.src = src;
+    await img.decode();
+    const w = img.width, h = img.height;
+    const scale = Math.min(1, maxSide / Math.max(w,h));
+    const cw = Math.round(w*scale), ch = Math.round(h*scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = cw; canvas.height = ch;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, cw, ch);
+    return canvas.toDataURL('image/jpeg', quality);
+  }
+
+  // 住所をその場で取得（Nominatim）。★メールを自分のに変更してください
+  async function getAddressFromNominatim(lat, lon){
+    const email = 'fujiwara71007@gmail.com'; // ←あなたのメールに変更
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1&accept-language=ja&email=${encodeURIComponent(email)}`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': `TokyoParcelMapper/1.0 (+${email})` }
+    });
+    if (!res.ok) throw new Error('RG HTTP '+res.status);
+    const j = await res.json();
+    return j.display_name || '';
+  }
+
+  // MapLibre（ラスタ）
   const map = new maplibregl.Map({
     container:'map',
     style:{
@@ -65,7 +93,7 @@
     center:[139.7671,35.6812], zoom:14
   });
 
-  // 現在地マーカー＆追従
+  // 現在地追従
   let follow = true, watchId=null;
   const me = new maplibregl.Marker({ color:'#06b6d4' });
   const startWatch = ()=>{
@@ -81,9 +109,9 @@
   document.getElementById('follow').onchange = (e)=> follow = e.target.checked;
   document.getElementById('goto').onclick = ()=> { follow=true; document.getElementById('follow').checked=true; };
 
-  // 地図タップで送信対象の点を作成
+  // 地図タップ → ピン設置
   const pin = new maplibregl.Marker({ color:'#111' });
-  let last = null; // {lat,lon}
+  let last = null;
   map.on('click', (e)=>{
     const {lng,lat} = e.lngLat;
     pin.setLngLat([lng,lat]).addTo(map);
@@ -98,19 +126,25 @@
     const category = document.getElementById('category').value;
     const memo = document.getElementById('memo').value.trim();
     const file = document.getElementById('photo').files[0];
-    const photo = file ? await toDataURL(file) : null;
+
+    // 住所を先に取得（失敗したら空のまま送る）
+    let address = null;
+    try { address = await getAddressFromNominatim(last.lat, last.lon); }
+    catch(_) { address = null; }
+
+    // 写真は圧縮して送る（なければ null）
+    const photo = file ? await compressImage(file, 1600, 0.7) : null;
 
     const payload = {
       timestamp: new Date().toISOString(),
       lat: last.lat, lon: last.lon,
       category, memo,
-      address: null,      // 住所は後でバッチ付与
-      parcel: {},         // 地番は第2段階で追加
+      address,            // 取れた住所を入れる（取れなければ null）
+      parcel: {},         // 地番は後で追加
       photo, photoName: file ? file.name : null
     };
 
     try{
-      // CORS回避のため text/plain で送る
       const res = await fetch(GAS_ENDPOINT, {
         method:'POST', mode:'cors',
         headers:{ 'Content-Type':'text/plain' },
@@ -121,8 +155,7 @@
       document.getElementById('memo').value='';
       document.getElementById('photo').value='';
     }catch(e){
-      console.error(e);
-      toast('送信に失敗。電波復帰後に再送してください');
+      toast('送信に失敗。電波復帰後に再送します');
       const q = JSON.parse(localStorage.getItem('queue')||'[]');
       q.push(payload); localStorage.setItem('queue', JSON.stringify(q));
     }
@@ -136,7 +169,7 @@
       try{
         const r = await fetch(GAS_ENDPOINT, { method:'POST', headers:{'Content-Type':'text/plain'}, body: JSON.stringify(item) });
         if (!r.ok) throw 0;
-      }catch{ return; } // 失敗したら中断（あとでまた）
+      }catch{ return; }
     }
     localStorage.removeItem('queue'); toast('オフライン分を再送しました');
   }
