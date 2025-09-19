@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Tokyo Parcel Mapper - MVP</title>
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <style>
+    html,body,#map{height:100%;margin:0}
+    #ui{position:fixed;top:.5rem;left:.5rem;right:.5rem;background:#fff;padding:.5rem;border-radius:.6rem;
+        box-shadow:0 4px 16px rgba(0,0,0,.08);font-family:system-ui}
+    #ui .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.25rem 0}
+    .pill{padding:.4rem .6rem;border:1px solid #ddd;border-radius:.6rem}
+    .btn{padding:.5rem .8rem;border:1px solid #111;background:#111;color:#fff;border-radius:.6rem}
+    #toast{position:fixed;bottom:.8rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;
+           padding:.4rem .6rem;border-radius:.6rem;display:none}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="ui">
+  <div class="row"><b>Tokyo Parcel Mapper – MVP</b></div>
+  <div class="row">
+    <label class="pill"><input id="follow" type="checkbox" checked> 現在地に追従</label>
+    <button id="goto" class="btn">現在地へ</button>
+  </div>
+  <div class="row">
+    <select id="category" class="pill">
+      <option>駐車場</option><option>古屋</option><option>空き家</option>
+      <option>更地</option><option>古アパート</option><option>その他</option>
+    </select>
+    <input id="memo" class="pill" placeholder="メモ（任意）" />
+    <input id="photo" class="pill" type="file" accept="image/*" capture="environment" />
+    <button id="send" class="btn" disabled>この地点を送信</button>
+  </div>
+  <div class="row" style="font-size:.9rem;color:#666">地図をタップ → 点を作成 → 送信でシートに保存</div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  // === https://script.google.com/macros/library/d/1v0cUrSBVitzGm4c-LElrsTCncgHzbqbevRsYTHwAzYRS4VDKEteiW0p3/2 ===
+  const GAS_ENDPOINT = 'https://script.google.com/macros/s/1ILuh0jqGEswrBab8Ec_vjzLduIYj10TIhqU08GxSA14/exec';
+
+  // 地理院タイル（標準地図）
+  const GSI = "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
+
+  // ユーティリティ
+  const toast = (m)=>{ const t=document.getElementById('toast'); t.textContent=m;
+    t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2000); };
+  const toDataURL = (file)=> new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
+
+  // MapLibre（ラスタベース）
+  const map = new maplibregl.Map({
+    container:'map',
+    style:{
+      "version":8,
+      "sources":{
+        "gsi":{ "type":"raster", "tiles":[GSI], "tileSize":256, "attribution":"地理院タイル" }
+      },
+      "layers":[ { "id":"gsi", "type":"raster", "source":"gsi" } ]
+    },
+    center:[139.7671,35.6812], zoom:14
+  });
+
+  // 現在地マーカー＆追従
+  let follow = true, watchId=null;
+  const me = new maplibregl.Marker({ color:'#06b6d4' });
+  const startWatch = ()=>{
+    if (!navigator.geolocation){ toast('位置情報が使えません'); return; }
+    if (watchId) return;
+    watchId = navigator.geolocation.watchPosition(p=>{
+      const {latitude:lat, longitude:lon} = p.coords;
+      me.setLngLat([lon,lat]).addTo(map);
+      if (follow) map.easeTo({center:[lon,lat], duration:500});
+    }, ()=>toast('位置情報取得に失敗'), { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+  };
+  map.on('load', startWatch);
+  document.getElementById('follow').onchange = (e)=> follow = e.target.checked;
+  document.getElementById('goto').onclick = ()=> { follow=true; document.getElementById('follow').checked=true; };
+
+  // 地図タップで送信対象の点を作成
+  const pin = new maplibregl.Marker({ color:'#111' });
+  let last = null; // {lat,lon}
+  map.on('click', (e)=>{
+    const {lng,lat} = e.lngLat;
+    pin.setLngLat([lng,lat]).addTo(map);
+    last = { lat, lon: lng };
+    document.getElementById('send').disabled = false;
+    toast(`選択: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
+  });
+
+  // 送信
+  document.getElementById('send').onclick = async ()=>{
+    if (!last){ toast('地図をタップして地点を選んでください'); return; }
+    const category = document.getElementById('category').value;
+    const memo = document.getElementById('memo').value.trim();
+    const file = document.getElementById('photo').files[0];
+    const photo = file ? await toDataURL(file) : null;
+
+    const payload = {
+      timestamp: new Date().toISOString(),
+      lat: last.lat, lon: last.lon,
+      category, memo,
+      address: null,      // 住所は後でバッチ付与
+      parcel: {},         // 地番は第2段階で追加
+      photo, photoName: file ? file.name : null
+    };
+
+    try{
+      // CORS回避のため text/plain で送る
+      const res = await fetch(GAS_ENDPOINT, {
+        method:'POST', mode:'cors',
+        headers:{ 'Content-Type':'text/plain' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error('HTTP '+res.status);
+      toast('送信しました（シートに保存）');
+      document.getElementById('memo').value='';
+      document.getElementById('photo').value='';
+    }catch(e){
+      console.error(e);
+      toast('送信に失敗。電波復帰後に再送してください');
+      const q = JSON.parse(localStorage.getItem('queue')||'[]');
+      q.push(payload); localStorage.setItem('queue', JSON.stringify(q));
+    }
+  };
+
+  // オフライン送信キュー
+  async function flush(){
+    const q = JSON.parse(localStorage.getItem('queue')||'[]');
+    if (!q.length) return;
+    for (const item of q){
+      try{
+        const r = await fetch(GAS_ENDPOINT, { method:'POST', headers:{'Content-Type':'text/plain'}, body: JSON.stringify(item) });
+        if (!r.ok) throw 0;
+      }catch{ return; } // 失敗したら中断（あとでまた）
+    }
+    localStorage.removeItem('queue'); toast('オフライン分を再送しました');
+  }
+  window.addEventListener('online', flush); flush();
+</script>
+</body>
+</html>
