@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
-  <title>Tokyo Parcel Mapper - MVP</title>
+  <title>Tokyo Parcel Mapper - Address Fast</title>
   <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
   <style>
@@ -33,7 +33,7 @@
 <div id="map"></div>
 
 <div id="ui">
-  <div class="row"><b>Tokyo Parcel Mapper – MVP</b></div>
+  <div class="row"><b>Tokyo Parcel Mapper – Address Fast</b></div>
   <div class="row">
     <label class="pill"><input id="follow" type="checkbox" checked> 現在地に追従</label>
     <button id="goto" class="btn">現在地へ</button>
@@ -46,18 +46,21 @@
     </select>
     <input id="memo" class="pill" placeholder="メモ（任意）" />
   </div>
-  <!-- ★選択中の住所（ピンを置くと自動更新） -->
+
+  <!-- 選択中の住所（ピンを置くと自動更新） -->
   <div class="row">
     <div id="addrBox" class="pill" style="flex:1;min-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">
       住所: （まだ選択されていません）
     </div>
   </div>
+
   <div class="row">
     <input id="photo" class="pill" type="file" accept="image/*" capture="environment" />
     <button id="send" class="btn" disabled>この地点を送信</button>
   </div>
+
   <div class="row" style="font-size:.9rem;color:#666">
-    地図をタップ → ピン作成 → 住所が表示されたら送信（丁目＋番地まで）
+    地図をタップ → ピン作成 → 住所が出たら送信（丁目＋番地まで）。地番は送信しません。
   </div>
 </div>
 
@@ -67,12 +70,12 @@
 <script>
   /* ←必要ならあなたの /exec に変更 */
   const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbw4wmqV__4kQO77AJmSLpyuLQH9tSblJJfxCWhIqHdpeEbX23ZZzEj2RV0OpwyK3sv5/exec';
-  const GSI = "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
+  const GSI_TILE = "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
   const NOMI_EMAIL = 'you@example.com'; // 任意で自分のメールに
 
   /* ====== 共通ユーティリティ ====== */
   const toast = (m)=>{ const t=document.getElementById('toast'); t.textContent=m;
-    t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2400); };
+    t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2200); };
   const showBusy = (on)=>{ document.getElementById('busy').style.display = on ? 'flex' : 'none'; };
   const joinJP = (...p)=> p.filter(Boolean).join('');
   function distMeters(a,b){const R=6378137,toRad=x=>x*Math.PI/180;
@@ -95,32 +98,38 @@
     canvas.getContext('2d').drawImage(img,0,0,cw,ch);
     return canvas.toDataURL('image/jpeg', quality);
   }
-  async function fetchT(url, opts={}, ms=8000){
+  async function fetchT(url, opts={}, ms=7000){
     const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort('timeout'), ms);
     try{ const res = await fetch(url, {...opts, signal: ctl.signal}); return res; }
     finally{ clearTimeout(t); }
   }
 
-  /* ====== 住所：高速＋番地まで ====== */
+  /* ====== 住所：住所だけ（地番なし）を最速で ====== */
+
+  // 町名・丁目＋市区町村：GSI（速い）
   async function gsiTown(lat, lon){
     const url = `https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat=${lat}&lon=${lon}`;
-    const r = await fetchT(url, {}, 6000); if (!r.ok) throw new Error('GSI '+r.status);
+    const r = await fetchT(url, {}, 5000); if (!r.ok) throw new Error('GSI '+r.status);
     const j = await r.json(); const x = j.results || {};
     return { muni: x.muniNm || '', town: [x.lv01Nm,x.lv02Nm,x.lv03Nm].filter(Boolean).join('') };
   }
+  // 都道府県：Nominatim（軽量）
   async function nomiPref(lat, lon){
-    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=8&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
-    const r = await fetchT(url, {headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}}, 6000);
+    const u = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=8&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
+    const r = await fetchT(u,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}},4500);
     if (!r.ok) return ''; const j = await r.json(); return (j.address||{}).state || '';
   }
+  // 番地：Overpass（速い時だけ使う／小半径＋短タイムアウト）
   async function overpassHouseNo(lat, lon){
-    const radii=[25,50]; const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+    const radii=[25,50]; // 小さめ半径
+    const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
     for (const radius of radii){
-      const q = `[out:json][timeout:12];(nwr(around:${radius},${lat},${lon})["addr:housenumber"];nwr(around:${radius},${lat},${lon})["addr:block_number"];nwr(around:${radius},${lat},${lon})["addr:lot_number"];);out center tags 30;`;
+      const q = `[out:json][timeout:10];(nwr(around:${radius},${lat},${lon})["addr:housenumber"];nwr(around:${radius},${lat},${lon})["addr:block_number"];nwr(around:${radius},${lat},${lon})["addr:lot_number"];);out center tags 30;`;
       for (const ep of eps){
         try{
-          const r = await fetchT(ep,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)},7000);
+          const r = await fetchT(ep,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)},5000);
           if (!r.ok) continue; const j = await r.json(); if (!j.elements?.length) continue;
+          // 近いものから番地文字列を
           let best='', bestD=1e9;
           for (const el of j.elements){
             const c = el.center ? {lat:el.center.lat, lon:el.center.lon} : (el.lat?{lat:el.lat,lon:el.lon}:null);
@@ -133,34 +142,76 @@
           if (best) return best;
         }catch(_){}
       }
-    } return '';
+    }
+    return '';
   }
+  // 最寄り建物の中心点（道路上クリックズレ対策）
+  async function nearestBuildingCenter(lat, lon){
+    const q = `[out:json][timeout:10];way(around:100,${lat},${lon})["building"];out center 20;`;
+    const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
+    for (const ep of eps){
+      try{
+        const r = await fetchT(ep,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)},5000);
+        if (!r.ok) continue; const j = await r.json(); if (!j.elements?.length) continue;
+        let best=null, bestD=1e9;
+        for (const w of j.elements){
+          if (!w.center) continue; const c={lat:w.center.lat,lon:w.center.lon};
+          const d=distMeters({lat,lon},c); if (d<bestD){best=c;bestD=d;}
+        }
+        if (best) return best;
+      }catch(_){}
+    }
+    return null;
+  }
+  // house_number（最終フォールバック）
   async function nomiHouseNo(lat, lon){
     try{
       const u = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=20&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
-      const r = await fetchT(u,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}},6000);
+      const r = await fetchT(u,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}},5000);
       if (!r.ok) return ''; const j = await r.json();
       return (j.address&&j.address.house_number)? String(j.address.house_number):'';
     }catch(_){ return ''; }
   }
-  const addrCache = new Map();
-  const cacheKey = (lat,lon)=>`${lat.toFixed(4)},${lon.toFixed(4)}`;
-  async function getPreciseAddressFast(lat, lon){
-    const key = cacheKey(lat,lon); if (addrCache.has(key)) return addrCache.get(key);
-    const pTown = gsiTown(lat,lon); const pPref = nomiPref(lat,lon);
-    const pHouse = (async()=>{ const a=overpassHouseNo(lat,lon); const b=nomiHouseNo(lat,lon);
-      const [ra,rb]=await Promise.allSettled([a,b]); const va=ra.status==='fulfilled'?ra.value:''; const vb=rb.status==='fulfilled'?rb.value:'';
-      return va||vb||''; })();
-    const [twn,pref,house] = await Promise.allSettled([pTown,pPref,pHouse]);
-    const muni = twn.status==='fulfilled'?twn.value.muni:''; const town=twn.status==='fulfilled'?twn.value.town:'';
-    const state=pref.status==='fulfilled'?pref.value:''; const hn=house.status==='fulfilled'?house.value:'';
-    const line = joinJP(state,muni,town,hn||''); addrCache.set(key,line); return line;
+
+  // リクエスト世代（古い住所解決結果を破棄するため）
+  let addrGen = 0;
+
+  async function resolveAddress(lat, lon, onProgress){
+    const myGen = ++addrGen;
+
+    // 先に町名だけ素早く
+    onProgress('取得中…');
+    let quick = {muni:'', town:''};
+    try { quick = await gsiTown(lat, lon); } catch(_){}
+    if (myGen !== addrGen) return null; // キャンセル
+    if (quick.muni || quick.town) onProgress(joinJP('', quick.muni, quick.town));
+
+    // 並列で：都道府県・番地
+    const prefP = nomiPref(lat, lon);
+    // 番地は Overpass と Nominatim を並列→ダメなら建物中心でNominatim
+    const houseP = (async()=>{
+      const [a,b] = await Promise.allSettled([overpassHouseNo(lat,lon), nomiHouseNo(lat,lon)]);
+      let hn = (a.status==='fulfilled' && a.value)?a.value : (b.status==='fulfilled'&&b.value)?b.value : '';
+      if (!hn){
+        const c = await nearestBuildingCenter(lat, lon);
+        if (c) hn = await nomiHouseNo(c.lat, c.lon);
+      }
+      return hn || '';
+    })();
+
+    const [pref, house] = await Promise.allSettled([prefP, houseP]);
+    if (myGen !== addrGen) return null; // キャンセル
+
+    const state = pref.status==='fulfilled'?pref.value:'';
+    const hn    = house.status==='fulfilled'?house.value:'';
+    const line  = joinJP(state, quick.muni, quick.town, hn||'');
+    return line;
   }
 
   /* ====== MapLibre 初期化 ====== */
   const map = new maplibregl.Map({
     container:'map',
-    style:{ version:8, sources:{ gsi:{ type:'raster', tiles:[GSI], tileSize:256, attribution:'地理院タイル' } },
+    style:{ version:8, sources:{ gsi:{ type:'raster', tiles:[GSI_TILE], tileSize:256, attribution:'地理院タイル' } },
             layers:[ { id:'gsi', type:'raster', source:'gsi' } ] },
     center:[139.7671,35.6812], zoom:14
   });
@@ -177,23 +228,18 @@
     const now = performance.now();
     const acc = coords.accuracy || 9999;
     const fresh = {lat:coords.latitude, lon:coords.longitude};
-
-    if (acc > 50) return;                    // 精度悪すぎは無視
-    if (now - lastUpdateAt < 500) return;    // 更新しすぎ防止
-
+    if (acc > 50) return;
+    if (now - lastUpdateAt < 500) return;
     if (lastRaw){
       const move = distMeters(lastRaw, fresh);
-      const threshold = Math.max(3, acc*0.5); // 微小揺れは無視
+      const threshold = Math.max(3, acc*0.5);
       if (move < threshold) return;
     }
-
     const alpha=0.25;
     smoothed = smoothed ? { lat: smoothed.lat+(fresh.lat-smoothed.lat)*alpha,
                             lon: smoothed.lon+(fresh.lon-smoothed.lon)*alpha } : fresh;
-
     me.setLngLat([smoothed.lon, smoothed.lat]).addTo(map);
     if (follow) map.easeTo({center:[smoothed.lon, smoothed.lat], duration:500});
-
     if (typeof coords.heading==='number' && !isNaN(coords.heading)){
       headingDeg = smoothHeading(headingDeg, coords.heading, 0.25);
       beamEl().style.transform = `translate(-2px,-50%) rotate(${headingDeg}deg)`;
@@ -230,7 +276,7 @@
   }
   document.getElementById('heading').onclick = enableHeading;
 
-  /* ====== クリック → ピン設置＆住所取得（高速表示→番地まで） ====== */
+  /* ====== タップ → ピン設置＆住所解決（キャンセル対応） ====== */
   const pin = new maplibregl.Marker({ color:'#111' });
   let last = null;
 
@@ -238,27 +284,18 @@
     pin.setLngLat([lng,lat]).addTo(map);
     last = { lat, lon: lng, address: '' };
     document.getElementById('send').disabled = true;
-    document.getElementById('addrBox').textContent = '住所: 取得中…';
+    const box = document.getElementById('addrBox');
 
-    try{
-      // まずGSIだけで町字を即表示（体感を速く）
-      const quick = await gsiTown(lat, lng).catch(()=>({muni:'',town:''}));
-      if (quick.muni || quick.town){
-        document.getElementById('addrBox').textContent = '住所: ' + joinJP('', quick.muni, quick.town);
-      }
-      // 並列で番地まで取りにいく
-      const full = await getPreciseAddressFast(lat, lng);
-      last.address = full || joinJP('', quick.muni, quick.town);
-      document.getElementById('addrBox').textContent = '住所: ' + (last.address || '取得できませんでした');
-      document.getElementById('send').disabled = false;
-    }catch(_){
-      document.getElementById('addrBox').textContent = '住所: 取得失敗';
-      document.getElementById('send').disabled = false;
-    }
+    // 住所解決（古いリクエストは破棄）
+    const line = await resolveAddress(lat, lng, (txt)=>{ box.textContent = '住所: ' + txt; });
+    if (line==null) return; // キャンセル
+    last.address = line || '';
+    box.textContent = '住所: ' + (last.address || '取得できませんでした');
+    document.getElementById('send').disabled = false;
   }
   map.on('click', (e)=>{ const {lng,lat}=e.lngLat; setSelection(lng,lat); });
 
-  /* ====== 送信（送信中ロック／オフライン再送） ====== */
+  /* ====== 送信（住所のみ送る／送信中ロック／再送キュー） ====== */
   let sending = false;
   document.getElementById('send').onclick = async ()=>{
     if (!last){ toast('地図をタップして地点を選んでください'); return; }
@@ -270,7 +307,6 @@
       const memo = document.getElementById('memo').value.trim();
       const file = document.getElementById('photo').files[0];
 
-      // 写真（任意）：JPEG圧縮
       let photo = null, photoName = null;
       if (file){
         try{
@@ -285,8 +321,7 @@
         timestamp: new Date().toISOString(), // JST化はGAS側
         lat: last.lat, lon: last.lon,
         category, memo,
-        address: last.address || '',
-        parcel: {},
+        address: last.address || '', // ★地番は送らない
         photo, photoName
       };
 
@@ -305,7 +340,7 @@
       q.push({timestamp:new Date().toISOString(), lat:last.lat, lon:last.lon,
               category:document.getElementById('category').value,
               memo:document.getElementById('memo').value.trim(),
-              address:last.address||'', parcel:{}, photo:null, photoName:null});
+              address:last.address||'', photo:null, photoName:null});
       localStorage.setItem('queue', JSON.stringify(q));
     }finally{
       sending = false; document.getElementById('send').disabled = false; showBusy(false);
