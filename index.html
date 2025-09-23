@@ -57,7 +57,7 @@
     <button id="send" class="btn" disabled>この地点を送信</button>
   </div>
   <div class="row" style="font-size:.9rem;color:#666">
-    地図をタップ → ピン作成 → 住所が表示されたら送信
+    地図をタップ → ピン作成 → 住所が表示されたら送信（丁目＋番地まで）
   </div>
 </div>
 
@@ -68,19 +68,26 @@
   /* ←必要ならあなたの /exec に変更 */
   const GAS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbw4wmqV__4kQO77AJmSLpyuLQH9tSblJJfxCWhIqHdpeEbX23ZZzEj2RV0OpwyK3sv5/exec';
   const GSI = "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png";
-  const NOMI_EMAIL = 'you@example.com'; // Nominatim の連絡先（任意で自分のに変更推奨）
+  const NOMI_EMAIL = 'you@example.com'; // 任意で自分のメールに
 
-  /* UIユーティリティ */
+  /* ====== 共通ユーティリティ ====== */
   const toast = (m)=>{ const t=document.getElementById('toast'); t.textContent=m;
     t.style.display='block'; clearTimeout(window._to); window._to=setTimeout(()=>t.style.display='none',2400); };
   const showBusy = (on)=>{ document.getElementById('busy').style.display = on ? 'flex' : 'none'; };
-
-  /* 画像処理 */
+  const joinJP = (...p)=> p.filter(Boolean).join('');
+  function distMeters(a,b){const R=6378137,toRad=x=>x*Math.PI/180;
+    const dLat=toRad(b.lat-a.lat),dLon=toRad(b.lon-a.lon);
+    const sa=Math.sin(dLat/2),sb=Math.sin(dLon/2);
+    const c=2*Math.asin(Math.sqrt(sa*sa+Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*sb*sb));
+    return R*c;}
+  function smoothHeading(prev, next, alpha=0.25){
+    if (prev==null || isNaN(prev)) return next;
+    let diff = ((next - prev + 540) % 360) - 180; return (prev + diff*alpha + 360) % 360;
+  }
   const toDataURL = (f)=> new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(f); });
   function dataUrlBytes(u){ const b64=(u.split(',')[1]||''); return Math.floor((b64.length*3)/4); }
   async function compressImage(file, maxSide=1600, quality=0.7){
-    if (!file) return null;
-    const src = await toDataURL(file);
+    if (!file) return null; const src = await toDataURL(file);
     const img = new Image(); img.src = src; await img.decode();
     const w = img.width, h = img.height, scale = Math.min(1, maxSide/Math.max(w,h));
     const cw = Math.round(w*scale), ch = Math.round(h*scale);
@@ -88,85 +95,69 @@
     canvas.getContext('2d').drawImage(img,0,0,cw,ch);
     return canvas.toDataURL('image/jpeg', quality);
   }
+  async function fetchT(url, opts={}, ms=8000){
+    const ctl = new AbortController(); const t = setTimeout(()=>ctl.abort('timeout'), ms);
+    try{ const res = await fetch(url, {...opts, signal: ctl.signal}); return res; }
+    finally{ clearTimeout(t); }
+  }
 
-  /* ========= 住所（丁目＋番地まで）。道路・テナント名は使わない ========= */
-  const joinJP = (...p)=> p.filter(Boolean).join('');
-  async function getFromGSI(lat, lon){
+  /* ====== 住所：高速＋番地まで ====== */
+  async function gsiTown(lat, lon){
     const url = `https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat=${lat}&lon=${lon}`;
-    const r = await fetch(url); if (!r.ok) throw new Error('GSI HTTP '+r.status);
-    const j = await r.json(), x = j.results || {};
+    const r = await fetchT(url, {}, 6000); if (!r.ok) throw new Error('GSI '+r.status);
+    const j = await r.json(); const x = j.results || {};
     return { muni: x.muniNm || '', town: [x.lv01Nm,x.lv02Nm,x.lv03Nm].filter(Boolean).join('') };
   }
-  async function getHouseNumberOverpass(lat, lon){
-    const radii=[25,50,80], eps=[
-      'https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'
-    ];
+  async function nomiPref(lat, lon){
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=8&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
+    const r = await fetchT(url, {headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}}, 6000);
+    if (!r.ok) return ''; const j = await r.json(); return (j.address||{}).state || '';
+  }
+  async function overpassHouseNo(lat, lon){
+    const radii=[25,50]; const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
     for (const radius of radii){
-      const q = `
-        [out:json][timeout:15];
-        (
-          nwr(around:${radius},${lat},${lon})["addr:housenumber"];
-          nwr(around:${radius},${lat},${lon})["addr:block_number"];
-          nwr(around:${radius},${lat},${lon})["addr:lot_number"];
-        ); out center tags 50;
-      `.trim();
+      const q = `[out:json][timeout:12];(nwr(around:${radius},${lat},${lon})["addr:housenumber"];nwr(around:${radius},${lat},${lon})["addr:block_number"];nwr(around:${radius},${lat},${lon})["addr:lot_number"];);out center tags 30;`;
       for (const ep of eps){
         try{
-          const res = await fetch(ep,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)});
-          if (!res.ok) continue; const j = await res.json(); if (!j.elements?.length) continue;
-          // 一番近いもの
-          let best=null, bestD=1e9;
+          const r = await fetchT(ep,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)},7000);
+          if (!r.ok) continue; const j = await r.json(); if (!j.elements?.length) continue;
+          let best='', bestD=1e9;
           for (const el of j.elements){
             const c = el.center ? {lat:el.center.lat, lon:el.center.lon} : (el.lat?{lat:el.lat,lon:el.lon}:null);
             if (!c) continue;
-            const d = distanceMeters({lat,lon},{lat:c.lat,lon:c.lon});
-            const t = el.tags||{};
-            const hn = t['addr:housenumber'];
-            const bn = t['addr:block_number']; const ln = t['addr:lot_number'];
-            let num = hn ? String(hn) : [bn,ln].filter(Boolean).join('-');
-            if (!num) continue;
-            if (d < bestD){ bestD=d; best=num; }
+            const d = distMeters({lat,lon},{lat:c.lat,lon:c.lon});
+            const t = el.tags||{}; const hn=t['addr:housenumber']; const bn=t['addr:block_number']; const ln=t['addr:lot_number'];
+            const num = hn ? String(hn) : [bn,ln].filter(Boolean).join('-');
+            if (!num) continue; if (d<bestD){best=num;bestD=d;}
           }
           if (best) return best;
         }catch(_){}
       }
-    }
-    return '';
+    } return '';
   }
-  async function getHouseNumberNominatim(lat, lon){
+  async function nomiHouseNo(lat, lon){
     try{
-      const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=20&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
-      const r = await fetch(url,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}});
+      const u = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=20&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
+      const r = await fetchT(u,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}},6000);
       if (!r.ok) return ''; const j = await r.json();
       return (j.address&&j.address.house_number)? String(j.address.house_number):'';
     }catch(_){ return ''; }
   }
-  async function getPref(lat, lon){
-    try{
-      const u = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=8&addressdetails=1&accept-language=ja&email=${encodeURIComponent(NOMI_EMAIL)}`;
-      const r = await fetch(u,{headers:{'User-Agent':`TokyoParcelMapper/1.0 (+${NOMI_EMAIL})`}});
-      const j = await r.json(); return (j.address||{}).state || '';
-    }catch(_){ return ''; }
-  }
-  function distanceMeters(a,b){
-    const R=6378137, toRad=x=>x*Math.PI/180;
-    const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
-    const sa=Math.sin(dLat/2), sb=Math.sin(dLon/2);
-    const c=2*Math.asin(Math.sqrt(sa*sa+Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*sb*sb));
-    return R*c;
-  }
-  async function getPreciseAddress(lat, lon){
-    const [gsi, pref] = await Promise.allSettled([getFromGSI(lat,lon), getPref(lat,lon)]);
-    const muni = gsi.status==='fulfilled' ? gsi.value.muni : '';
-    const town = gsi.status==='fulfilled' ? gsi.value.town : '';
-    const state= pref.status==='fulfilled' ? pref.value : '';
-    let house = '';
-    try{ house = await getHouseNumberOverpass(lat, lon); }catch(_){}
-    if (!house){ try{ house = await getHouseNumberNominatim(lat, lon); }catch(_){} }
-    return joinJP(state, muni, town, house || '');
+  const addrCache = new Map();
+  const cacheKey = (lat,lon)=>`${lat.toFixed(4)},${lon.toFixed(4)}`;
+  async function getPreciseAddressFast(lat, lon){
+    const key = cacheKey(lat,lon); if (addrCache.has(key)) return addrCache.get(key);
+    const pTown = gsiTown(lat,lon); const pPref = nomiPref(lat,lon);
+    const pHouse = (async()=>{ const a=overpassHouseNo(lat,lon); const b=nomiHouseNo(lat,lon);
+      const [ra,rb]=await Promise.allSettled([a,b]); const va=ra.status==='fulfilled'?ra.value:''; const vb=rb.status==='fulfilled'?rb.value:'';
+      return va||vb||''; })();
+    const [twn,pref,house] = await Promise.allSettled([pTown,pPref,pHouse]);
+    const muni = twn.status==='fulfilled'?twn.value.muni:''; const town=twn.status==='fulfilled'?twn.value.town:'';
+    const state=pref.status==='fulfilled'?pref.value:''; const hn=house.status==='fulfilled'?house.value:'';
+    const line = joinJP(state,muni,town,hn||''); addrCache.set(key,line); return line;
   }
 
-  /* ============ MapLibre ============ */
+  /* ====== MapLibre 初期化 ====== */
   const map = new maplibregl.Map({
     container:'map',
     style:{ version:8, sources:{ gsi:{ type:'raster', tiles:[GSI], tileSize:256, attribution:'地理院タイル' } },
@@ -174,67 +165,100 @@
     center:[139.7671,35.6812], zoom:14
   });
 
-  /* 現在地（青い丸＋方向ビーム） */
+  /* ====== 現在地（ゆらぎ抑制＋方位） ====== */
   let follow = true, watchId=null, headingDeg=0;
-  const meEl = document.createElement('div');
-  meEl.className='me-wrap';
+  const meEl = document.createElement('div'); meEl.className='me-wrap';
   meEl.innerHTML = '<div class="me-beam" id="beam"></div><div class="me-dot"></div>';
-  const me = new maplibregl.Marker({ element: meEl, rotationAlignment:'map' }); // map基準で回転
-  const beam = ()=> meEl.querySelector('#beam');
+  const me = new maplibregl.Marker({ element: meEl, rotationAlignment:'map' });
+  const beamEl = ()=> meEl.querySelector('#beam');
+
+  let smoothed=null, lastRaw=null, lastUpdateAt=0;
+  function applyPosition(coords){
+    const now = performance.now();
+    const acc = coords.accuracy || 9999;
+    const fresh = {lat:coords.latitude, lon:coords.longitude};
+
+    if (acc > 50) return;                    // 精度悪すぎは無視
+    if (now - lastUpdateAt < 500) return;    // 更新しすぎ防止
+
+    if (lastRaw){
+      const move = distMeters(lastRaw, fresh);
+      const threshold = Math.max(3, acc*0.5); // 微小揺れは無視
+      if (move < threshold) return;
+    }
+
+    const alpha=0.25;
+    smoothed = smoothed ? { lat: smoothed.lat+(fresh.lat-smoothed.lat)*alpha,
+                            lon: smoothed.lon+(fresh.lon-smoothed.lon)*alpha } : fresh;
+
+    me.setLngLat([smoothed.lon, smoothed.lat]).addTo(map);
+    if (follow) map.easeTo({center:[smoothed.lon, smoothed.lat], duration:500});
+
+    if (typeof coords.heading==='number' && !isNaN(coords.heading)){
+      headingDeg = smoothHeading(headingDeg, coords.heading, 0.25);
+      beamEl().style.transform = `translate(-2px,-50%) rotate(${headingDeg}deg)`;
+    }
+    lastRaw=fresh; lastUpdateAt=now;
+  }
 
   map.on('load', ()=>{
     if (!navigator.geolocation){ toast('位置情報が使えません'); return; }
-    watchId = navigator.geolocation.watchPosition(p=>{
-      const {latitude:lat, longitude:lon, heading} = p.coords;
-      me.setLngLat([lon,lat]).addTo(map);
-      if (follow) map.easeTo({center:[lon,lat], duration:500});
-      // 位置情報の heading が取れたら優先（m/sで移動中のみ出る端末もあり）
-      if (typeof heading === 'number' && !isNaN(heading)){
-        headingDeg = heading;
-        beam().style.transform = `translate(-2px,-50%) rotate(${headingDeg}deg)`;
-      }
-    }, ()=>toast('位置情報取得に失敗'), { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+    watchId = navigator.geolocation.watchPosition(
+      p => applyPosition(p.coords),
+      _ => toast('位置情報取得に失敗'),
+      { enableHighAccuracy:true, maximumAge:5000, timeout:15000 }
+    );
   });
   document.getElementById('follow').onchange = (e)=> follow = e.target.checked;
   document.getElementById('goto').onclick = ()=> { follow=true; document.getElementById('follow').checked=true; };
 
-  // 方位センサー（iOSはユーザー操作で許可が必要）
   async function enableHeading(){
     try{
       if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function'){
-        const st = await DeviceOrientationEvent.requestPermission(); if (st !== 'granted') { toast('方位センサーが許可されませんでした'); return; }
+        const st = await DeviceOrientationEvent.requestPermission();
+        if (st !== 'granted'){ toast('方位センサーが許可されませんでした'); return; }
       }
       window.addEventListener('deviceorientation', (ev)=>{
-        // iOS: webkitCompassHeading（0=北,時計回り） / 他: alpha（0=地磁気北）
-        const h = (ev.webkitCompassHeading != null) ? ev.webkitCompassHeading : (360 - (ev.alpha||0));
-        if (!isNaN(h)){ headingDeg = h; beam().style.transform = `translate(-2px,-50%) rotate(${headingDeg}deg)`; }
+        const raw = (ev.webkitCompassHeading != null) ? ev.webkitCompassHeading : (360 - (ev.alpha||0));
+        if (!isNaN(raw)){
+          headingDeg = smoothHeading(headingDeg, raw, 0.2);
+          beamEl().style.transform = `translate(-2px,-50%) rotate(${headingDeg}deg)`;
+        }
       }, true);
       toast('方位センサーON');
     }catch(_){ toast('方位センサー利用不可'); }
   }
   document.getElementById('heading').onclick = enableHeading;
 
-  /* タップで送信用ピン（黒）＆住所表示 */
+  /* ====== クリック → ピン設置＆住所取得（高速表示→番地まで） ====== */
   const pin = new maplibregl.Marker({ color:'#111' });
   let last = null;
+
   async function setSelection(lng, lat){
     pin.setLngLat([lng,lat]).addTo(map);
-    last = { lat, lon: lng };
+    last = { lat, lon: lng, address: '' };
     document.getElementById('send').disabled = true;
     document.getElementById('addrBox').textContent = '住所: 取得中…';
+
     try{
-      const addr = await getPreciseAddress(lat, lng);
-      last.address = addr || '';
-      document.getElementById('addrBox').textContent = '住所: ' + (addr || '取得できませんでした');
+      // まずGSIだけで町字を即表示（体感を速く）
+      const quick = await gsiTown(lat, lng).catch(()=>({muni:'',town:''}));
+      if (quick.muni || quick.town){
+        document.getElementById('addrBox').textContent = '住所: ' + joinJP('', quick.muni, quick.town);
+      }
+      // 並列で番地まで取りにいく
+      const full = await getPreciseAddressFast(lat, lng);
+      last.address = full || joinJP('', quick.muni, quick.town);
+      document.getElementById('addrBox').textContent = '住所: ' + (last.address || '取得できませんでした');
       document.getElementById('send').disabled = false;
     }catch(_){
-      last.address = '';
       document.getElementById('addrBox').textContent = '住所: 取得失敗';
+      document.getElementById('send').disabled = false;
     }
   }
   map.on('click', (e)=>{ const {lng,lat}=e.lngLat; setSelection(lng,lat); });
 
-  /* 送信（送信中ロック） */
+  /* ====== 送信（送信中ロック／オフライン再送） ====== */
   let sending = false;
   document.getElementById('send').onclick = async ()=>{
     if (!last){ toast('地図をタップして地点を選んでください'); return; }
@@ -261,8 +285,8 @@
         timestamp: new Date().toISOString(), // JST化はGAS側
         lat: last.lat, lon: last.lon,
         category, memo,
-        address: last.address || '',   // ★UIに表示した住所をそのまま送る
-        parcel: {},                    // 地番は別工程で追加予定
+        address: last.address || '',
+        parcel: {},
         photo, photoName
       };
 
@@ -288,13 +312,11 @@
     }
   };
 
-  /* オフライン再送 */
   async function flush(){
-    const q = JSON.parse(localStorage.getItem('queue')||'[]');
-    if (!q.length) return;
+    const q = JSON.parse(localStorage.getItem('queue')||'[]'); if (!q.length) return;
     for (const item of q){
       try{
-        const r = await fetch(GAS_ENDPOINT, { method:'POST', headers:{'Content-Type':'text/plain'}, body: JSON.stringify(item) });
+        const r = await fetch(GAS_ENDPOINT,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(item)});
         if (!r.ok) throw 0;
       }catch{ return; }
     }
